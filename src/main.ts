@@ -1,0 +1,146 @@
+
+import { Buffer } from "buffer";
+import { MarkdownView, Notice, Platform, Plugin } from "obsidian";
+import { PluginActiveRequestManager } from "./core/active-request-manager";
+import { runChatCommand } from "./core/chat-command";
+import { setConvoDebugLoggingEnabled } from "./core/debug-log";
+import { runChatWithDocumentCommand, runNewChatCommand, runNewChatRightCommand } from "./core/new-chat-command";
+import { runRetitleNoteCommand } from "./core/retitle-note-command";
+import { sanitizeSettings } from "./core/frontmatter";
+import { requestRetitleApproval } from "./core/retitle-note-approval";
+import { PluginRequestStatusManager } from "./core/request-status";
+import { DEFAULT_SETTINGS, loadPluginSettings, savePluginSettings } from "./core/settings";
+import { ConvoGptSettingTab } from "./core/settings-tab";
+import type { PluginSettings } from "./core/types";
+
+if (typeof globalThis.Buffer === "undefined") {
+	globalThis.Buffer = Buffer;
+}
+
+export default class ConvoGptPlugin extends Plugin {
+	settings: PluginSettings = DEFAULT_SETTINGS;
+	private activeRequestManager = new PluginActiveRequestManager();
+	private requestStatusManager!: PluginRequestStatusManager;
+
+	override async onload(): Promise<void> {
+		this.requestStatusManager = new PluginRequestStatusManager(
+			this.addStatusBarItem(),
+			Platform.isMobile,
+			(text, duration) => {
+				return new Notice(text, duration);
+			},
+		);
+		this.settings = await loadPluginSettings(this);
+		setConvoDebugLoggingEnabled(this.settings.enableDebugLogging);
+		this.requestStatusManager.clear();
+		this.addSettingTab(new ConvoGptSettingTab(this.app, this));
+
+		this.addCommand({
+			id: "chat",
+			name: "Chat",
+			icon: "message-circle",
+			editorCallback: (editor, view) => {
+				if (!(view instanceof MarkdownView)) {
+					new Notice("Convo GPT can only run in markdown views.");
+					return;
+				}
+
+				void runChatCommand({
+					app: this.app,
+					editor,
+					requestManager: this.activeRequestManager,
+					view,
+					settings: this.settings,
+					requestStatus: this.requestStatusManager,
+				});
+			},
+		});
+
+		this.addCommand({
+			id: "cancel-current-request",
+			name: "Cancel Current Request",
+			icon: "square",
+			callback: () => {
+				const canceled = this.activeRequestManager.cancelActiveRequest();
+				if (!canceled) {
+					new Notice("Convo GPT has no active request to cancel.");
+					return;
+				}
+
+				this.requestStatusManager.clear();
+				new Notice("Convo GPT request canceled.");
+			},
+		});
+
+		this.addCommand({
+			id: "new-chat",
+			name: "New Chat",
+			icon: "plus-square",
+			callback: () => {
+				void runNewChatCommand(this.app, this.settings);
+			},
+		});
+
+		this.addCommand({
+			id: "new-chat-right",
+			name: "New Chat (to the right)",
+			icon: "plus-square",
+			callback: () => {
+				void runNewChatRightCommand(this.app, this.settings);
+			},
+		});
+
+		this.addCommand({
+			id: "chat-with-this-document",
+			name: "Chat with this Document",
+			icon: "message-circle-plus",
+			editorCallback: (_editor, view) => {
+				if (!(view instanceof MarkdownView)) {
+					new Notice("Convo GPT can only run in markdown views.");
+					return;
+				}
+
+				void runChatWithDocumentCommand(this.app, this.settings, view.file);
+			},
+		});
+
+		this.addCommand({
+			id: "summarize-and-retitle-note",
+			name: "Summarize And Retitle Note",
+			icon: "whole-word",
+			editorCallback: (editor, view) => {
+				if (!(view instanceof MarkdownView)) {
+					new Notice("Convo GPT can only run in markdown views.");
+					return;
+				}
+
+				void runRetitleNoteCommand({
+					app: this.app,
+					approver: (request, signal) => requestRetitleApproval(this.app, request, signal),
+					editor,
+					notify: (message) => {
+						new Notice(message);
+					},
+					requestManager: this.activeRequestManager,
+					view,
+					settings: this.settings,
+					requestStatus: this.requestStatusManager,
+				});
+			},
+		});
+	}
+
+	override onunload(): void {
+		this.activeRequestManager.cancelActiveRequest();
+		this.requestStatusManager.clear();
+	}
+
+	async updateSettings(nextSettings: Partial<PluginSettings>): Promise<void> {
+		this.settings = sanitizeSettings({
+			...this.settings,
+			...nextSettings,
+		});
+		setConvoDebugLoggingEnabled(this.settings.enableDebugLogging);
+		await savePluginSettings(this, this.settings);
+	}
+}

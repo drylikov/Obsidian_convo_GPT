@@ -1,0 +1,11 @@
+
+{
+	"id": "convo-gpt",
+	"name": "Convo GPT",
+	"version": "0.1.0",
+	"minAppVersion": "1.5.0",
+	"description": "OpenAI-first markdown conversations inside Obsidian notes.",
+	"author": "Denis Rylikov",
+	"authorUrl": "https://github.com/drylikov",
+	"isDesktopOnly": false
+}

@@ -1,0 +1,1347 @@
+
+import { Notice, TFile, type App, type Editor, type MarkdownView } from "obsidian";
+import { isConvoAbortError, PluginActiveRequestManager, type ActiveRequestManager } from "./active-request-manager";
+import { resolveAgent } from "./agent-resolver";
+import { AITraceCollector, appendAITraceLog } from "./ai-trace";
+import { resolveChatConfig } from "./chat-config";
+import { injectReferencedNoteContext } from "./context-resolver";
+import { parseNoteDocument } from "./frontmatter";
+import {
+	buildLinkedDocumentSystemPrompt,
+	buildLinkedDocumentToolPolicy,
+	detectLinkedDocumentEditIntent,
+	linkifyLinkedDocumentMentions,
+	loadLinkedDocumentContext,
+	shouldContinueLinkedDocumentDrafting,
+	type LinkedDocumentContext,
+} from "./document-mode";
+import { executeFetchToolCall } from "./fetch-service";
+import { logConvoDebug } from "./debug-log";
+import {
+	buildFetchToolPolicy,
+	FETCH_TOOL_NAME,
+	formatFetchAppendix,
+	parseFetchRequest,
+	shouldOfferFetchTool,
+	type FetchSummary,
+} from "./fetch-tool";
+import {
+	executeMarkdownWriteToolCall,
+} from "./markdown-file-service";
+import {
+	addReferencedFileReadSeeds,
+	createReferencedFileReadState,
+	executeReferencedFileReadToolCall,
+	executeReferencedFileSearchToolCall,
+	executeReferencedFileSectionToolCall,
+	type ReferencedFileReadState,
+} from "./referenced-file-service";
+import {
+	buildMarkdownFileToolPolicy,
+	formatMarkdownWriteAppendix,
+	MAX_MARKDOWN_TOOL_ROUNDS,
+	MARKDOWN_FILE_TOOL_NAME,
+	parseMarkdownWriteRequest,
+	shouldOfferMarkdownFileTool,
+	type MarkdownWriteSummary,
+} from "./markdown-file-tool";
+import {
+	buildFunctionCallOutput,
+	formatReferencedFileSearchAppendix,
+	formatReferencedFileSectionAppendix,
+	formatReferencedFileAppendix,
+	buildReferencedFileToolPolicy,
+	normalizeReferencedFileLookup,
+	parseReferencedFileReadRequest,
+	parseReferencedFileSearchRequest,
+	parseReferencedFileSectionReadRequest,
+	REFERENCED_FILE_SEARCH_TOOL_NAME,
+	REFERENCED_FILE_SECTION_TOOL_NAME,
+	REFERENCED_FILE_TOOL_NAME,
+	type ReferencedFileSummary,
+	type ReferencedFileSearchSummary,
+	type ReferencedFileSectionSummary,
+	type ReferencedFileReadToolResult,
+} from "./referenced-file-tool";
+import { requestToolRoundLimitApproval } from "./tool-round-limit-approval";
+import { isGeneratedChatBasename } from "./note-title";
+import { shouldShowTopOfAnswerLink } from "./response-length";
+import { parseSections } from "./message-parser";
+import {
+	createForcedFunctionToolChoice,
+	OpenAIClient,
+	type CreateTurnParams,
+	type OpenAICompletion,
+	type OpenAITurn,
+} from "./openai-client";
+import { formatRequestModelLabel } from "./request-label";
+import type { RequestStatusManager } from "./request-status";
+import { buildAssistantPrefix, buildAssistantSuffix, getNextExchangeId } from "./response-anchors";
+import { StreamingWriter } from "./streaming-writer";
+import { inferRetitledBasename } from "./title-inference";
+import type { ChatMessage, PluginSettings, ResolvedChatConfig } from "./types";
+
+interface ChatCommandContext {
+	app: App;
+	editor: Editor;
+	requestManager?: ActiveRequestManager;
+	requestStatus: RequestStatusManager;
+	view: MarkdownView;
+	settings: PluginSettings;
+}
+
+export async function runChatCommand(context: ChatCommandContext): Promise<void> {
+	const { app, editor, requestStatus, settings, view } = context;
+	const requestManager = context.requestManager ?? new PluginActiveRequestManager();
+	const file = view.file;
+
+	if (!file) {
+		new Notice("Convo GPT requires an open note.");
+		return;
+	}
+
+	let exchangeId: string;
+	let document: ReturnType<typeof parseNoteDocument>;
+	let config: ResolvedChatConfig;
+	let messages: ChatMessage[];
+	let linkedDocument: LinkedDocumentContext | undefined;
+	let referencedFileReadState: ReferencedFileReadState | undefined;
+	let agentBodyForTitle = "";
+	let agentFileForTitle: TFile | null = null;
+	let shouldAutoRetitle = false;
+	let activeRequest: ReturnType<ActiveRequestManager["beginActiveRequest"]> | null = null;
+	let aiTrace: AITraceCollector | null = null;
+
+	try {
+		const editorText = editor.getValue();
+		exchangeId = getNextExchangeId(editorText);
+		document = await loadNoteDocumentForChat(app, file, editorText);
+		const sections = parseSections(document.body);
+		if (sections.length === 0) {
+			new Notice("Convo GPT needs note content to send.");
+			return;
+		}
+
+		const lastSection = sections[sections.length - 1];
+		if (!lastSection || lastSection.role !== "user" || !lastSection.content.trim()) {
+			new Notice("Convo GPT expects the last message in the note to be a non-empty user message.");
+			return;
+		}
+		shouldAutoRetitle =
+			isGeneratedChatBasename(file.basename) &&
+			sections.filter((section) => section.role === "user").length === 1 &&
+			sections.every((section) => section.role !== "assistant");
+
+		linkedDocument = await resolveLinkedDocument(
+			app,
+			file,
+			document.overrides.document,
+			lastSection.content,
+			sections
+				.filter((section) => section.role === "user")
+				.slice(0, -1)
+				.map((section) => section.content),
+		);
+
+		const agent = await resolveAgent(app, settings, document.overrides.agent);
+		agentFileForTitle = agent?.file ?? null;
+		config = resolveChatConfig(settings, agent?.frontmatter, document.overrides);
+		if (config.ai_log) {
+			aiTrace = new AITraceCollector({
+				aiLogPath: config.ai_log,
+				maxTokens: config.max_tokens,
+				model: config.model,
+				notePath: file.path,
+				operation: "chat",
+				reasoningEffort: config.reasoning_effort,
+				stream: config.stream,
+				temperature: config.temperature,
+			});
+		}
+		if (!config.apiKey) {
+			new Notice("Convo GPT is missing an OpenAI API key.");
+			return;
+		}
+
+		let agentBody = agent?.body ?? "";
+		if (config.enableReferencedFileReadTool) {
+			referencedFileReadState = createReferencedFileReadState(
+				config.referencedFileExtensions,
+				config.referencedFileReadMaxChars,
+			);
+
+			if (agent && agentBody.trim()) {
+				const missingReferences = addReferencedFileReadSeeds(app, referencedFileReadState, [
+					{
+						currentFile: agent.file,
+						content: agentBody,
+					},
+				]);
+				if (missingReferences.length > 0) {
+					new Notice(`Convo GPT could not resolve agent references: ${missingReferences.join(", ")}`);
+				}
+			}
+
+			const missingReferences = addReferencedFileReadSeeds(app, referencedFileReadState, [
+				{
+					currentFile: file,
+					content: document.body,
+				},
+			]);
+			if (missingReferences.length > 0) {
+				new Notice(`Convo GPT could not resolve: ${missingReferences.join(", ")}`);
+			}
+		} else if (agent && agentBody.trim()) {
+			const enrichedAgent = await injectReferencedNoteContext(app, agent.file, agentBody);
+			if (enrichedAgent.missingReferences.length > 0) {
+				new Notice(`Convo GPT could not resolve agent references: ${enrichedAgent.missingReferences.join(", ")}`);
+			}
+			agentBody = enrichedAgent.content;
+		}
+		agentBodyForTitle = agentBody;
+
+		messages = await buildMessages(
+			app,
+			file,
+			sections.map((section) => ({
+				role: section.role,
+				content: section.content,
+			})),
+			config,
+			agentBody,
+			linkedDocument,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		new Notice(`Convo GPT request failed: ${message}`);
+		return;
+	}
+
+	const lastMessage = messages[messages.length - 1];
+	activeRequest = requestManager.beginActiveRequest();
+	if (!activeRequest) {
+		new Notice("Convo GPT already has an active request. Cancel it before starting another one.");
+		return;
+	}
+	const activeRequestSignal = activeRequest.signal;
+
+	const assistantBlockStartOffset = editor.getValue().length;
+	const assistantPrefix = buildAssistantPrefix(config.model, exchangeId);
+	let writeOffset = editor.getValue().length;
+	editor.replaceRange(assistantPrefix, editor.offsetToPos(writeOffset));
+	writeOffset += assistantPrefix.length;
+	const completionStartOffset = writeOffset;
+
+	let completionText = "";
+	let sourcesAppendix = "";
+	let mcpUsageAppendix = "";
+	let maxOutputTokensAppendix = "";
+	let shouldPlaceFinalCursor = true;
+	let shouldAttemptAutoRetitle = false;
+	let hitMaxOutputTokens = false;
+	let wasCanceled = false;
+	const mcpNoticesUsed: string[] = [];
+	const recordMcpNotice = (text: string): void => {
+		requestStatus.notifyToolUse(text);
+		mcpNoticesUsed.push(text);
+	};
+	const shouldUseFetchTool = shouldOfferFetchTool(lastMessage.content, config.enableFetchTool);
+	const shouldUseMarkdownFileTool = shouldOfferMarkdownFileTool(
+		lastMessage.content,
+		config.enableMarkdownFileTool,
+		Boolean(linkedDocument?.shouldAutoWrite),
+	);
+	const shouldUseReferencedFileTool = Boolean(
+		config.enableReferencedFileReadTool && referencedFileReadState && referencedFileReadState.allowedPaths.size > 0,
+	);
+	logConvoDebug("chat.run.flags", {
+		notePath: file.path,
+		linkedDocumentPath: linkedDocument?.path ?? null,
+		linkedDocumentAutoWrite: linkedDocument?.shouldAutoWrite ?? false,
+		shouldUseFetchTool,
+		shouldUseMarkdownFileTool,
+		shouldUseReferencedFileTool,
+	});
+	aiTrace?.recordEvent("Chat run flags", {
+		linkedDocumentAutoWrite: linkedDocument?.shouldAutoWrite ?? false,
+		linkedDocumentPath: linkedDocument?.path ?? null,
+		shouldUseFetchTool,
+		shouldUseMarkdownFileTool,
+		shouldUseReferencedFileTool,
+	});
+
+	try {
+		const client = new OpenAIClient(config);
+		const requestModelLabel = formatRequestModelLabel(config);
+		requestStatus.notifyRequestStart(`Calling ${requestModelLabel}`);
+		requestStatus.setCalling(requestModelLabel);
+
+		if (shouldUseFetchTool || shouldUseMarkdownFileTool || shouldUseReferencedFileTool) {
+			const toolResult = await runToolConversation(
+				app,
+				client,
+				withToolPolicies(messages, {
+					includeFetchTool: shouldUseFetchTool,
+					includeMarkdownFileTool: shouldUseMarkdownFileTool,
+					includeReferencedFileTool: shouldUseReferencedFileTool,
+					linkedDocument,
+				}),
+				requestModelLabel,
+				requestStatus,
+				{
+					includeFetchTool: shouldUseFetchTool,
+					includeMarkdownFileTool: shouldUseMarkdownFileTool,
+					includeReferencedFileTool: shouldUseReferencedFileTool,
+					linkedDocument,
+					onMcpNotice: recordMcpNotice,
+					referencedFileReadState,
+					requireLinkedDocumentSave: linkedDocument?.shouldAutoWrite === true,
+					signal: activeRequestSignal,
+					stopBeforePlainAssistantTurn: config.stream,
+					traceCollector: aiTrace ?? undefined,
+				},
+			);
+			if (toolResult.kind === "completion") {
+				completionText = toolResult.completion.text;
+				sourcesAppendix = toolResult.completion.sourcesAppendix;
+				hitMaxOutputTokens = toolResult.completion.hitMaxOutputTokens;
+				completionText = postProcessCompletionText(completionText, linkedDocument);
+				editor.replaceRange(completionText, editor.offsetToPos(writeOffset));
+				writeOffset += completionText.length;
+			} else {
+				let continuation = toolResult.continuation;
+
+				while (true) {
+					const streamedStartOffset = writeOffset;
+					const writer = new StreamingWriter(editor, editor.offsetToPos(writeOffset));
+					writer.start();
+					let didSetStreamingStatus = false;
+					let streamedText = "";
+					let streamedResponse: OpenAITurn;
+					try {
+						streamedResponse = await client.streamTurn(
+							{
+								includeFetchTool: shouldUseFetchTool,
+								includeMarkdownFileTool: shouldUseMarkdownFileTool,
+								includeReferencedFileTool: shouldUseReferencedFileTool,
+								inputItems: continuation.inputItems,
+								instructions: continuation.instructions,
+								previousResponseId: continuation.previousResponseId,
+								toolChoice: continuation.toolChoice,
+							},
+							{
+								onSearchStart: () => {
+									requestStatus.notifyToolUse("Using web search");
+									requestStatus.setWebSearch();
+								},
+								onToolUse: (text) => {
+									recordMcpNotice(text);
+								},
+								onText: (delta) => {
+									if (!didSetStreamingStatus) {
+										requestStatus.setStreaming(requestModelLabel);
+										didSetStreamingStatus = true;
+									}
+
+									writer.append(delta);
+									streamedText += delta;
+								},
+							},
+							{ signal: activeRequestSignal, traceCollector: aiTrace ?? undefined, traceLabel: "OpenAI chat streamed continuation" },
+						);
+					} finally {
+						writer.stop();
+						writeOffset = editor.posToOffset(writer.getCursor());
+						shouldPlaceFinalCursor = writer.isAutoFollowEnabled();
+					}
+
+					if (streamedResponse.toolCalls.length === 0) {
+						for (const notice of streamedResponse.mcpNotices ?? []) {
+							recordMcpNotice(notice);
+						}
+						completionText = streamedText || streamedResponse.text;
+						const nextCompletionText = postProcessCompletionText(completionText, linkedDocument);
+						if (nextCompletionText !== completionText) {
+							editor.replaceRange(
+								nextCompletionText,
+								editor.offsetToPos(streamedStartOffset),
+								editor.offsetToPos(writeOffset),
+							);
+							writeOffset = streamedStartOffset + nextCompletionText.length;
+						}
+						completionText = nextCompletionText;
+						sourcesAppendix = `${streamedResponse.sourcesAppendix}${formatToolConversationAppendix(continuation.state)}`;
+						hitMaxOutputTokens = hitMaxOutputTokens || streamedResponse.hitMaxOutputTokens;
+						break;
+					}
+
+					editor.replaceRange("", editor.offsetToPos(streamedStartOffset), editor.offsetToPos(writeOffset));
+					writeOffset = streamedStartOffset;
+
+					const resumedToolResult = await resumeToolConversation(
+						app,
+						client,
+						streamedResponse,
+						requestModelLabel,
+						requestStatus,
+						continuation.instructions,
+						{
+							includeFetchTool: shouldUseFetchTool,
+							includeMarkdownFileTool: shouldUseMarkdownFileTool,
+							includeReferencedFileTool: shouldUseReferencedFileTool,
+							linkedDocument,
+							onMcpNotice: recordMcpNotice,
+							referencedFileReadState,
+							requireLinkedDocumentSave: linkedDocument?.shouldAutoWrite === true,
+							signal: activeRequestSignal,
+							stopBeforePlainAssistantTurn: true,
+							traceCollector: aiTrace ?? undefined,
+						},
+						continuation.state,
+						continuation.roundsCompleted,
+					);
+
+					if (resumedToolResult.kind === "completion") {
+						completionText = postProcessCompletionText(resumedToolResult.completion.text, linkedDocument);
+						sourcesAppendix = resumedToolResult.completion.sourcesAppendix;
+						hitMaxOutputTokens = hitMaxOutputTokens || resumedToolResult.completion.hitMaxOutputTokens;
+						editor.replaceRange(completionText, editor.offsetToPos(writeOffset));
+						writeOffset += completionText.length;
+						break;
+					}
+
+					continuation = resumedToolResult.continuation;
+				}
+			}
+		} else if (config.stream) {
+			const writer = new StreamingWriter(editor, editor.offsetToPos(writeOffset));
+			writer.start();
+			let didSetStreamingStatus = false;
+			let completion: OpenAICompletion;
+			try {
+				completion = await client.stream(messages, {
+					onSearchStart: () => {
+						requestStatus.notifyToolUse("Using web search");
+						requestStatus.setWebSearch();
+					},
+					onToolUse: (text) => {
+						recordMcpNotice(text);
+					},
+					onText: (delta) => {
+						if (!didSetStreamingStatus) {
+							requestStatus.setStreaming(requestModelLabel);
+							didSetStreamingStatus = true;
+						}
+
+						writer.append(delta);
+						completionText += delta;
+					},
+				}, { signal: activeRequestSignal, traceCollector: aiTrace ?? undefined, traceLabel: "OpenAI chat stream" });
+			} finally {
+				writer.stop();
+				writeOffset = editor.posToOffset(writer.getCursor());
+				shouldPlaceFinalCursor = writer.isAutoFollowEnabled();
+			}
+			for (const notice of completion.mcpNotices ?? []) {
+				recordMcpNotice(notice);
+			}
+			hitMaxOutputTokens = completion.hitMaxOutputTokens;
+			const nextCompletionText = postProcessCompletionText(completionText, linkedDocument);
+			if (nextCompletionText !== completionText) {
+				editor.replaceRange(nextCompletionText, editor.offsetToPos(completionStartOffset), editor.offsetToPos(writeOffset));
+				writeOffset = completionStartOffset + nextCompletionText.length;
+				completionText = nextCompletionText;
+			}
+
+			sourcesAppendix = completion.sourcesAppendix;
+		} else {
+			const completion = await client.create(messages, {
+				signal: activeRequestSignal,
+				traceCollector: aiTrace ?? undefined,
+				traceLabel: "OpenAI chat create",
+			});
+			for (const notice of completion.mcpNotices ?? []) {
+				recordMcpNotice(notice);
+			}
+			hitMaxOutputTokens = completion.hitMaxOutputTokens;
+			completionText = postProcessCompletionText(completion.text, linkedDocument);
+			sourcesAppendix = completion.sourcesAppendix;
+			editor.replaceRange(completionText, editor.offsetToPos(writeOffset));
+			writeOffset += completionText.length;
+		}
+
+		mcpUsageAppendix = formatMcpUsageAppendix(mcpNoticesUsed);
+		maxOutputTokensAppendix = formatMaxOutputTokensAppendix(hitMaxOutputTokens, config.max_tokens);
+		if (sourcesAppendix) {
+			editor.replaceRange(sourcesAppendix, editor.offsetToPos(writeOffset));
+			writeOffset += sourcesAppendix.length;
+		}
+		if (mcpUsageAppendix) {
+			editor.replaceRange(mcpUsageAppendix, editor.offsetToPos(writeOffset));
+			writeOffset += mcpUsageAppendix.length;
+		}
+		if (maxOutputTokensAppendix) {
+			editor.replaceRange(maxOutputTokensAppendix, editor.offsetToPos(writeOffset));
+			writeOffset += maxOutputTokensAppendix.length;
+		}
+		shouldAttemptAutoRetitle = shouldAutoRetitle;
+	} catch (error) {
+		if (isConvoAbortError(error)) {
+			wasCanceled = true;
+			aiTrace?.setOutcome("canceled", error instanceof Error ? error.message : String(error));
+			if (writeOffset === completionStartOffset) {
+				editor.replaceRange("", editor.offsetToPos(assistantBlockStartOffset), editor.offsetToPos(writeOffset));
+				writeOffset = assistantBlockStartOffset;
+			}
+		} else {
+		const message = error instanceof Error ? error.message : String(error);
+		aiTrace?.setOutcome("failed", message);
+		editor.replaceRange(`\n\n_Error: ${message}_`, editor.offsetToPos(writeOffset));
+		writeOffset += `\n\n_Error: ${message}_`.length;
+		new Notice(`Convo GPT request failed: ${message}`);
+		}
+	} finally {
+		requestStatus.clear();
+	}
+
+	try {
+		if (!wasCanceled || writeOffset > completionStartOffset) {
+			const assistantSuffix = buildAssistantSuffix(exchangeId, shouldShowTopOfAnswerLink(completionText));
+			editor.replaceRange(assistantSuffix, editor.offsetToPos(writeOffset));
+			if (shouldPlaceFinalCursor) {
+				editor.setCursor(editor.offsetToPos(writeOffset + assistantSuffix.length));
+			}
+		}
+
+		if (shouldAttemptAutoRetitle) {
+			const client = new OpenAIClient(config);
+			await autoRetitleChatNote(app, file, editor, client, {
+				agentBody: agentBodyForTitle,
+				agentFile: agentFileForTitle,
+				defaultSystemPrompt: config.defaultSystemPrompt,
+				traceCollector: aiTrace ?? undefined,
+				systemCommands: config.system_commands,
+				signal: activeRequestSignal,
+			});
+		}
+	} finally {
+		activeRequest?.finish();
+	}
+
+	if (aiTrace) {
+		if (!wasCanceled && aiTrace.currentOutcome === null) {
+			aiTrace.setOutcome("success");
+		}
+
+		try {
+			await appendAITraceLog(app, file.path, aiTrace, file.path);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logConvoDebug("chat.aiTrace.flushFailed", {
+				notePath: file.path,
+				error: message,
+			});
+			new Notice(`Convo GPT ai_log failed: ${message}`);
+		}
+	}
+}
+
+async function loadNoteDocumentForChat(app: App, file: TFile, editorText: string): Promise<ReturnType<typeof parseNoteDocument>> {
+	const editorDocument = parseNoteDocument(editorText);
+	const storedText = await readStoredNoteText(app, file);
+	if (storedText === null) {
+		logConvoDebug("chat.noteDocument.editorOnly", {
+			notePath: file.path,
+			editorHasDocument: Boolean(editorDocument.overrides.document),
+			editorHasAgent: Boolean(editorDocument.overrides.agent),
+		});
+		return editorDocument;
+	}
+
+	const storedDocument = parseNoteDocument(storedText);
+	logConvoDebug("chat.noteDocument.compare", {
+		notePath: file.path,
+		editorHasDocument: Boolean(editorDocument.overrides.document),
+		storedHasDocument: Boolean(storedDocument.overrides.document),
+		editorHasAgent: Boolean(editorDocument.overrides.agent),
+		storedHasAgent: Boolean(storedDocument.overrides.agent),
+		editorStartsWithFrontmatter: editorText.startsWith("---\n") || editorText.startsWith("---\r\n"),
+		storedStartsWithFrontmatter: storedText.startsWith("---\n") || storedText.startsWith("---\r\n"),
+	});
+
+	return {
+		...editorDocument,
+		overrides: mergeNoteOverrides(storedDocument.overrides, editorDocument.overrides),
+	};
+}
+
+async function readStoredNoteText(app: App, file: TFile): Promise<string | null> {
+	try {
+		if ("cachedRead" in app.vault && typeof app.vault.cachedRead === "function") {
+			return await app.vault.cachedRead(file);
+		}
+
+		return await app.vault.read(file);
+	} catch (error) {
+		logConvoDebug("chat.noteDocument.readStoredFailed", {
+			notePath: file.path,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return null;
+	}
+}
+
+function mergeNoteOverrides(
+	storedOverrides: ReturnType<typeof parseNoteDocument>["overrides"],
+	editorOverrides: ReturnType<typeof parseNoteDocument>["overrides"],
+): ReturnType<typeof parseNoteDocument>["overrides"] {
+	return {
+		...storedOverrides,
+		...editorOverrides,
+		system_commands:
+			editorOverrides.system_commands && editorOverrides.system_commands.length > 0
+				? editorOverrides.system_commands
+				: storedOverrides.system_commands ?? [],
+	};
+}
+
+async function buildMessages(
+	app: App,
+	file: MarkdownView["file"],
+	baseMessages: ChatMessage[],
+	config: ResolvedChatConfig,
+	agentBody: string,
+	linkedDocument?: LinkedDocumentContext,
+): Promise<ChatMessage[]> {
+	const messages: ChatMessage[] = [];
+
+	if (config.defaultSystemPrompt.trim()) {
+		messages.push({
+			role: "system",
+			content: config.defaultSystemPrompt.trim(),
+		});
+	}
+
+	if (agentBody.trim()) {
+		messages.push({
+			role: "system",
+			content: agentBody.trim(),
+		});
+	}
+
+	if (linkedDocument) {
+		messages.push({
+			role: "system",
+			content: buildLinkedDocumentSystemPrompt(linkedDocument),
+		});
+	}
+
+	for (const command of config.system_commands) {
+		if (command.trim()) {
+			messages.push({
+				role: "system",
+				content: command.trim(),
+			});
+		}
+	}
+
+	for (const message of baseMessages) {
+		if (message.role !== "user") {
+			messages.push(message);
+			continue;
+		}
+
+		if (config.enableReferencedFileReadTool) {
+			messages.push(message);
+			continue;
+		}
+
+		const enriched = await injectReferencedNoteContext(app, file ?? null, message.content);
+		if (enriched.missingReferences.length > 0) {
+			new Notice(`Convo GPT could not resolve: ${enriched.missingReferences.join(", ")}`);
+		}
+
+		messages.push({
+			...message,
+			content: enriched.content,
+		});
+	}
+
+	return messages;
+}
+
+interface ToolConversationOptions {
+	includeFetchTool: boolean;
+	includeMarkdownFileTool: boolean;
+	includeReferencedFileTool: boolean;
+	linkedDocument?: LinkedDocumentContext;
+	onMcpNotice?: (text: string) => void;
+	referencedFileReadState?: ReferencedFileReadState;
+	requireLinkedDocumentSave?: boolean;
+	signal?: AbortSignal;
+	stopBeforePlainAssistantTurn?: boolean;
+	traceCollector?: AITraceCollector;
+}
+
+interface ToolConversationState {
+	didSaveLinkedDocument: boolean;
+	fetchCalls: FetchSummary[];
+	hitMaxOutputTokens: boolean;
+	referencedFilesRead: ReferencedFileSummary[];
+	referencedFileSearches: ReferencedFileSearchSummary[];
+	referencedFileSections: ReferencedFileSectionSummary[];
+	markdownWrites: MarkdownWriteSummary[];
+}
+
+interface ToolConversationContinuation {
+	instructions?: string;
+	inputItems: NonNullable<CreateTurnParams["inputItems"]>;
+	previousResponseId: string;
+	roundsCompleted: number;
+	state: ToolConversationState;
+	toolChoice?: CreateTurnParams["toolChoice"];
+}
+
+type ToolConversationResult =
+	| {
+			kind: "completion";
+			completion: OpenAICompletion;
+	  }
+	| {
+			kind: "continue";
+			continuation: ToolConversationContinuation;
+	  };
+
+async function runToolConversation(
+	app: App,
+	client: OpenAIClient,
+	messages: ChatMessage[],
+	model: string,
+	requestStatus: RequestStatusManager,
+	options: ToolConversationOptions,
+): Promise<ToolConversationResult> {
+	const instructions = getSystemInstructions(messages);
+	logConvoDebug("chat.toolConversation.start", {
+		includeFetchTool: options.includeFetchTool,
+		includeMarkdownFileTool: options.includeMarkdownFileTool,
+		includeReferencedFileTool: options.includeReferencedFileTool,
+		requireLinkedDocumentSave: options.requireLinkedDocumentSave ?? false,
+		linkedDocumentPath: options.linkedDocument?.path ?? null,
+	});
+	let response = await client.createTurn({
+		messages,
+		includeFetchTool: options.includeFetchTool,
+		includeMarkdownFileTool: options.includeMarkdownFileTool,
+		includeReferencedFileTool: options.includeReferencedFileTool,
+		toolChoice: options.requireLinkedDocumentSave ? "required" : undefined,
+	}, { signal: options.signal, traceCollector: options.traceCollector, traceLabel: "OpenAI initial tool turn" });
+	return resumeToolConversation(
+		app,
+		client,
+		response,
+		model,
+		requestStatus,
+		instructions,
+		options,
+		{
+			didSaveLinkedDocument: false,
+			fetchCalls: [],
+			hitMaxOutputTokens: false,
+			markdownWrites: [],
+			referencedFilesRead: [],
+			referencedFileSearches: [],
+			referencedFileSections: [],
+		},
+		0,
+	);
+}
+
+async function resumeToolConversation(
+	app: App,
+	client: OpenAIClient,
+	response: OpenAITurn,
+	model: string,
+	requestStatus: RequestStatusManager,
+	instructions: string | undefined,
+	options: ToolConversationOptions,
+	state: ToolConversationState,
+	startingRound: number,
+): Promise<ToolConversationResult> {
+	let roundsCompleted = startingRound;
+	let maxRoundsBeforePrompt = MAX_MARKDOWN_TOOL_ROUNDS;
+
+	while (true) {
+		state.hitMaxOutputTokens = state.hitMaxOutputTokens || response.hitMaxOutputTokens;
+		for (const notice of response.mcpNotices ?? []) {
+			options.onMcpNotice?.(notice);
+		}
+		logConvoDebug("chat.toolConversation.round", {
+			round: roundsCompleted + 1,
+			responseId: response.responseId,
+			toolCallNames: response.toolCalls.map((toolCall) => toolCall.name),
+			didSaveLinkedDocument: state.didSaveLinkedDocument,
+		});
+
+		if (response.toolCalls.length === 0) {
+			if (options.requireLinkedDocumentSave && !state.didSaveLinkedDocument) {
+				logConvoDebug("chat.toolConversation.missingLinkedDocumentSave", {
+					responseId: response.responseId,
+					textLength: response.text.length,
+				});
+				throw new Error("Convo GPT expected to save the linked document, but the model did not call save_markdown_file.");
+			}
+
+			return {
+				kind: "completion",
+				completion: {
+					text: response.text,
+					sourcesAppendix: `${response.sourcesAppendix}${formatToolConversationAppendix(state)}`,
+					hitMaxOutputTokens: state.hitMaxOutputTokens,
+					mcpNotices: [],
+				},
+			};
+		}
+
+		const toolOutputs: NonNullable<CreateTurnParams["inputItems"]> = [];
+		for (const toolCall of response.toolCalls) {
+			options.traceCollector?.recordToolCall(toolCall.name, {
+				arguments: tryParseJson(toolCall.arguments),
+				callId: toolCall.call_id,
+				name: toolCall.name,
+			});
+			if (toolCall.name === FETCH_TOOL_NAME && options.includeFetchTool) {
+				requestStatus.notifyToolUse(describeFetchToolCall(toolCall.arguments));
+				const result = await executeFetchToolCall(toolCall.arguments, undefined, options.signal);
+				options.traceCollector?.recordToolResult(toolCall.name, result);
+				logConvoDebug("chat.toolConversation.fetchResult", {
+					status: result.status,
+					url: "url" in result ? result.url ?? null : null,
+					finalUrl: "finalUrl" in result ? result.finalUrl ?? null : null,
+					statusCode: "statusCode" in result ? result.statusCode ?? null : null,
+				});
+				if (result.status === "success" && result.method && result.statusCode && (result.finalUrl || result.url)) {
+					state.fetchCalls.push({
+						method: result.method,
+						statusCode: result.statusCode,
+						truncated: Boolean(result.truncated),
+						url: result.finalUrl || result.url!,
+					});
+				}
+				toolOutputs.push(buildFunctionCallOutput(toolCall.call_id, result));
+				continue;
+			}
+
+			if (toolCall.name === MARKDOWN_FILE_TOOL_NAME && options.includeMarkdownFileTool) {
+				requestStatus.notifyToolUse(describeMarkdownToolCall(toolCall.arguments));
+				const result = await executeMarkdownWriteToolCall(app, toolCall.arguments, undefined, {
+					signal: options.signal,
+					statusCallbacks: {
+						onSaving: (path) => {
+							requestStatus.setSaving(path);
+						},
+						onWaitingForApproval: () => {
+							requestStatus.setWaitingForFileApproval();
+						},
+					},
+					trustedPaths:
+						options.linkedDocument?.shouldAutoWrite === true
+							? new Set([options.linkedDocument.path])
+							: undefined,
+				});
+				options.traceCollector?.recordToolResult(toolCall.name, result);
+				logConvoDebug("chat.toolConversation.markdownWriteResult", {
+					status: result.status,
+					path: "path" in result ? result.path ?? null : null,
+					operation: "operation" in result ? result.operation ?? null : null,
+					message: "message" in result ? result.message : null,
+				});
+				if (result.status === "success" && options.requireLinkedDocumentSave) {
+					state.didSaveLinkedDocument = true;
+				}
+				if (result.status === "success" && result.path && result.operation) {
+					state.markdownWrites.push({
+						path: result.path,
+						operation: result.operation,
+					});
+				}
+				toolOutputs.push(buildFunctionCallOutput(toolCall.call_id, result));
+				continue;
+			}
+
+			if (toolCall.name === REFERENCED_FILE_TOOL_NAME && options.includeReferencedFileTool && options.referencedFileReadState) {
+				requestStatus.notifyToolUse(describeReferencedFileToolCall(toolCall.arguments));
+				const result = await executeReferencedFileReadToolCall(app, toolCall.arguments, options.referencedFileReadState, undefined, {
+					signal: options.signal,
+					statusCallbacks: {
+						onWaitingForApproval: () => {
+							requestStatus.setWaitingForFileApproval();
+						},
+					},
+				});
+				options.traceCollector?.recordToolResult(toolCall.name, result);
+				logConvoDebug("chat.toolConversation.referencedFileResult", {
+					status: result.status,
+					path: "path" in result ? result.path ?? null : null,
+					truncated: "truncated" in result ? Boolean(result.truncated) : false,
+				});
+				registerReferencedFileLikeResult(app, options.referencedFileReadState, result);
+				if (result.status === "success" && result.path) {
+					state.referencedFilesRead.push({
+						path: result.path,
+						truncated: Boolean(result.truncated),
+					});
+				}
+				toolOutputs.push(buildFunctionCallOutput(toolCall.call_id, result));
+				continue;
+			}
+
+			if (toolCall.name === REFERENCED_FILE_SEARCH_TOOL_NAME && options.includeReferencedFileTool && options.referencedFileReadState) {
+				requestStatus.notifyToolUse(describeReferencedFileSearchToolCall(toolCall.arguments));
+				const result = await executeReferencedFileSearchToolCall(app, toolCall.arguments, options.referencedFileReadState, {
+					signal: options.signal,
+				});
+				options.traceCollector?.recordToolResult(toolCall.name, result);
+				logConvoDebug("chat.toolConversation.referencedFileSearchResult", {
+					status: result.status,
+					path: "path" in result ? result.path ?? null : null,
+					matchCount: Array.isArray(result.matches) ? result.matches.length : 0,
+					truncated: Boolean(result.truncated),
+				});
+				if (result.status === "success" && result.path && result.query) {
+					state.referencedFileSearches.push({
+						path: result.path,
+						query: result.query,
+						truncated: Boolean(result.truncated),
+					});
+				}
+				toolOutputs.push(buildFunctionCallOutput(toolCall.call_id, result));
+				continue;
+			}
+
+			if (toolCall.name === REFERENCED_FILE_SECTION_TOOL_NAME && options.includeReferencedFileTool && options.referencedFileReadState) {
+				requestStatus.notifyToolUse(describeReferencedFileSectionToolCall(toolCall.arguments));
+				const result = await executeReferencedFileSectionToolCall(app, toolCall.arguments, options.referencedFileReadState, {
+					signal: options.signal,
+				});
+				options.traceCollector?.recordToolResult(toolCall.name, result);
+				logConvoDebug("chat.toolConversation.referencedFileSectionResult", {
+					status: result.status,
+					path: "path" in result ? result.path ?? null : null,
+					lineStart: "lineStart" in result ? result.lineStart ?? null : null,
+					lineEnd: "lineEnd" in result ? result.lineEnd ?? null : null,
+					sectionHeading: "sectionHeading" in result ? result.sectionHeading ?? null : null,
+				});
+				registerReferencedFileLikeResult(app, options.referencedFileReadState, result);
+				if (result.status === "success" && result.path) {
+					state.referencedFilesRead.push({
+						path: result.path,
+						truncated: Boolean(result.truncated),
+					});
+					if (typeof result.lineStart === "number" && typeof result.lineEnd === "number") {
+						state.referencedFileSections.push({
+							path: result.path,
+							lineStart: result.lineStart,
+							lineEnd: result.lineEnd,
+							sectionHeading: result.sectionHeading,
+						});
+					}
+				}
+				toolOutputs.push(buildFunctionCallOutput(toolCall.call_id, result));
+				continue;
+			}
+
+			toolOutputs.push(
+				buildFunctionCallOutput(toolCall.call_id, {
+					status: "validation_error",
+					message: `Unsupported tool call: ${toolCall.name}`,
+				}),
+			);
+			options.traceCollector?.recordToolResult(toolCall.name, {
+				status: "validation_error",
+				message: `Unsupported tool call: ${toolCall.name}`,
+			});
+		}
+
+		requestStatus.setCalling(model);
+		const nextToolChoice =
+			options.requireLinkedDocumentSave && !state.didSaveLinkedDocument
+				? createForcedFunctionToolChoice(MARKDOWN_FILE_TOOL_NAME)
+				: undefined;
+		if (options.stopBeforePlainAssistantTurn && nextToolChoice === undefined) {
+			return {
+				kind: "continue",
+				continuation: {
+					instructions,
+					inputItems: toolOutputs,
+					previousResponseId: response.responseId,
+					roundsCompleted: roundsCompleted + 1,
+					state,
+					toolChoice: nextToolChoice,
+				},
+			};
+		}
+
+		roundsCompleted += 1;
+		if (roundsCompleted >= maxRoundsBeforePrompt) {
+			requestStatus.setWaitingForContinueApproval();
+			const decision = await requestToolRoundLimitApproval(
+				app,
+				{
+					maxRounds: MAX_MARKDOWN_TOOL_ROUNDS,
+					roundsCompleted,
+				},
+				options.signal,
+			);
+			options.traceCollector?.recordEvent("Tool round limit decision", {
+				decision,
+				maxRounds: MAX_MARKDOWN_TOOL_ROUNDS,
+				roundsCompleted,
+			});
+			logConvoDebug("chat.toolConversation.roundLimitDecision", {
+				decision,
+				roundsCompleted,
+				maxRounds: MAX_MARKDOWN_TOOL_ROUNDS,
+			});
+
+			if (decision === "stop") {
+				return {
+					kind: "completion",
+					completion: {
+						text: "_Stopped after reaching the tool round limit before the model produced a final answer._",
+						sourcesAppendix: formatToolConversationAppendix(state),
+						hitMaxOutputTokens: state.hitMaxOutputTokens,
+						mcpNotices: [],
+					},
+				};
+			}
+
+			maxRoundsBeforePrompt += MAX_MARKDOWN_TOOL_ROUNDS;
+			requestStatus.setCalling(model);
+		}
+
+		logConvoDebug("chat.toolConversation.nextTurn", {
+			previousResponseId: response.responseId,
+			toolOutputCount: toolOutputs.length,
+			nextToolChoice: nextToolChoice ?? null,
+		});
+		response = await client.createTurn({
+			includeFetchTool: options.includeFetchTool,
+			includeMarkdownFileTool: options.includeMarkdownFileTool,
+			includeReferencedFileTool: options.includeReferencedFileTool,
+			inputItems: toolOutputs,
+			instructions,
+			previousResponseId: response.responseId,
+			toolChoice: nextToolChoice,
+		}, { signal: options.signal, traceCollector: options.traceCollector, traceLabel: "OpenAI tool continuation turn" });
+	}
+}
+
+function getSystemInstructions(messages: ChatMessage[]): string | undefined {
+	const instructions = messages
+		.filter((message) => message.role === "system")
+		.map((message) => message.content.trim())
+		.filter((message) => message.length > 0)
+		.join("\n\n");
+
+	return instructions || undefined;
+}
+
+function formatToolConversationAppendix(state: ToolConversationState): string {
+	return `${formatReferencedFileAppendix(state.referencedFilesRead)}${formatReferencedFileSearchAppendix(state.referencedFileSearches)}${formatReferencedFileSectionAppendix(state.referencedFileSections)}${formatMarkdownWriteAppendix(state.markdownWrites)}${formatFetchAppendix(state.fetchCalls)}`;
+}
+
+function formatMcpUsageAppendix(notices: string[]): string {
+	if (notices.length === 0) {
+		return "";
+	}
+
+	const seen = new Set<string>();
+	const lines: string[] = [];
+
+	for (const notice of notices) {
+		const trimmedNotice = notice.trim();
+		if (!trimmedNotice || seen.has(trimmedNotice)) {
+			continue;
+		}
+
+		seen.add(trimmedNotice);
+		const serverMatch = trimmedNotice.match(/^Using MCP server: (.+)$/);
+		if (serverMatch) {
+			lines.push(`- Server: ${serverMatch[1]}`);
+			continue;
+		}
+
+		const toolMatch = trimmedNotice.match(/^Using MCP tool: (.+)$/);
+		if (toolMatch) {
+			lines.push(`- Tool: ${toolMatch[1]}`);
+			continue;
+		}
+
+		lines.push(`- ${trimmedNotice}`);
+	}
+
+	if (lines.length === 0) {
+		return "";
+	}
+
+	return `\n\n### MCP usage\n${lines.join("\n")}`;
+}
+
+function formatMaxOutputTokensAppendix(hitMaxOutputTokens: boolean, maxOutputTokens: number): string {
+	if (!hitMaxOutputTokens) {
+		return "";
+	}
+
+	return `\n\n_Note: response stopped after hitting max_output_tokens (${maxOutputTokens})._`;
+}
+
+function describeFetchToolCall(argumentsJson: string): string {
+	const parsed = parseFetchRequest(argumentsJson);
+	if (!parsed.success) {
+		return "Using fetch";
+	}
+
+	return `Using fetch: ${parsed.data.method} ${parsed.data.url}`;
+}
+
+function describeMarkdownToolCall(argumentsJson: string): string {
+	const parsed = parseMarkdownWriteRequest(argumentsJson);
+	if (!parsed.success) {
+		return "Using markdown save tool";
+	}
+
+	return `Saving markdown file: ${parsed.data.path}`;
+}
+
+function describeReferencedFileToolCall(argumentsJson: string): string {
+	const parsed = parseReferencedFileReadRequest(argumentsJson);
+	if (!parsed.success) {
+		return "Reading referenced file";
+	}
+
+	const normalizedReference = normalizeReferencedFileLookup(parsed.data.reference);
+	return `Reading referenced file: ${normalizedReference || parsed.data.reference}`;
+}
+
+function describeReferencedFileSearchToolCall(argumentsJson: string): string {
+	const parsed = parseReferencedFileSearchRequest(argumentsJson);
+	if (!parsed.success) {
+		return "Searching referenced file";
+	}
+
+	const normalizedReference = normalizeReferencedFileLookup(parsed.data.reference);
+	return `Searching referenced file: ${normalizedReference || parsed.data.reference} for "${parsed.data.query.trim()}"`;
+}
+
+function describeReferencedFileSectionToolCall(argumentsJson: string): string {
+	const parsed = parseReferencedFileSectionReadRequest(argumentsJson);
+	if (!parsed.success) {
+		return "Reading referenced file section";
+	}
+
+	const normalizedReference = normalizeReferencedFileLookup(parsed.data.reference);
+	return `Reading referenced file section: ${normalizedReference || parsed.data.reference} at line ${parsed.data.line}`;
+}
+
+function withToolPolicies(
+	messages: ChatMessage[],
+	options: {
+		includeFetchTool: boolean;
+		includeMarkdownFileTool: boolean;
+		includeReferencedFileTool: boolean;
+		linkedDocument?: LinkedDocumentContext;
+	},
+): ChatMessage[] {
+	const nextMessages = [...messages];
+
+	if (options.includeFetchTool) {
+		nextMessages.push({
+			role: "system",
+			content: buildFetchToolPolicy(),
+		});
+	}
+
+	if (options.includeReferencedFileTool) {
+		nextMessages.push({
+			role: "system",
+			content: buildReferencedFileToolPolicy(),
+		});
+	}
+
+	if (options.includeMarkdownFileTool) {
+		nextMessages.push({
+			role: "system",
+			content: buildMarkdownFileToolPolicy(),
+		});
+
+		if (options.linkedDocument?.shouldAutoWrite) {
+			nextMessages.push({
+				role: "system",
+				content: buildLinkedDocumentToolPolicy(options.linkedDocument),
+			});
+		}
+	}
+
+	return nextMessages;
+}
+
+function registerReferencedFileLikeResult(
+	app: App,
+	state: ReferencedFileReadState,
+	result: ReferencedFileReadToolResult | { content?: string; path?: string; status: string },
+): void {
+	if (result.status !== "success" || !result.path || typeof result.content !== "string") {
+		return;
+	}
+
+	const file = app.vault.getAbstractFileByPath(result.path);
+	if (!(file instanceof TFile)) {
+		return;
+	}
+
+	addReferencedFileReadSeeds(app, state, [
+		{
+			currentFile: file,
+			content: result.content,
+		},
+	]);
+}
+
+async function resolveLinkedDocument(
+	app: App,
+	file: TFile,
+	reference: string | undefined,
+	lastUserMessage: string,
+	previousUserMessages: string[],
+): Promise<LinkedDocumentContext | undefined> {
+	if (!reference?.trim()) {
+		logConvoDebug("chat.resolveLinkedDocument.skipped", {
+			notePath: file.path,
+			reason: "missing_reference",
+		});
+		return undefined;
+	}
+
+	logConvoDebug("chat.resolveLinkedDocument.start", {
+		notePath: file.path,
+		reference,
+	});
+	const result = await loadLinkedDocumentContext(app, file.path, reference);
+	if (!result.success) {
+		logConvoDebug("chat.resolveLinkedDocument.failed", {
+			notePath: file.path,
+			reference,
+			error: result.error,
+		});
+		new Notice(`Convo GPT document mode disabled: ${result.error}`);
+		return undefined;
+	}
+
+	const shouldAutoWrite =
+		detectLinkedDocumentEditIntent(lastUserMessage) ||
+		shouldContinueLinkedDocumentDrafting(
+			lastUserMessage,
+			previousUserMessages.some((message) => detectLinkedDocumentEditIntent(message)),
+		);
+	logConvoDebug("chat.resolveLinkedDocument.success", {
+		notePath: file.path,
+		reference,
+		resolvedPath: result.context.path,
+		exists: result.context.exists,
+		shouldAutoWrite,
+	});
+	return {
+		...result.context,
+		shouldAutoWrite,
+	};
+}
+
+function postProcessCompletionText(text: string, linkedDocument?: LinkedDocumentContext): string {
+	if (!linkedDocument) {
+		return text;
+	}
+
+	return linkifyLinkedDocumentMentions(text, linkedDocument.path);
+}
+
+async function autoRetitleChatNote(
+	app: App,
+	file: TFile,
+	editor: Editor,
+	client: OpenAIClient,
+	context: {
+		agentBody: string;
+		agentFile: TFile | null;
+		defaultSystemPrompt: string;
+		signal?: AbortSignal;
+		traceCollector?: AITraceCollector;
+		systemCommands: string[];
+	},
+): Promise<void> {
+	try {
+		const document = parseNoteDocument(editor.getValue());
+		if (!document.body.trim()) {
+			return;
+		}
+
+		let agentBody = context.agentBody;
+		if (context.agentFile && agentBody.trim()) {
+			const enrichedAgent = await injectReferencedNoteContext(app, context.agentFile, agentBody);
+			if (enrichedAgent.missingReferences.length > 0) {
+				new Notice(`Convo GPT could not resolve agent references: ${enrichedAgent.missingReferences.join(", ")}`);
+			}
+			agentBody = enrichedAgent.content;
+		}
+
+		const enrichedDocument = await injectReferencedNoteContext(app, file, document.body);
+		if (enrichedDocument.missingReferences.length > 0) {
+			new Notice(`Convo GPT could not resolve: ${enrichedDocument.missingReferences.join(", ")}`);
+		}
+
+		const nextBasename = await inferRetitledBasename(client, {
+			currentBasename: file.basename,
+			noteContent: enrichedDocument.content,
+			agentBody,
+			defaultSystemPrompt: context.defaultSystemPrompt,
+			signal: context.signal,
+			traceCollector: context.traceCollector,
+			traceLabel: "OpenAI auto-retitle create",
+			systemCommands: context.systemCommands,
+		});
+		const nextPath = buildSiblingMarkdownPath(file.path, nextBasename);
+		if (nextPath === file.path) {
+			return;
+		}
+
+		logConvoDebug("chat.autoRetitle.rename", {
+			currentPath: file.path,
+			nextPath,
+		});
+		await app.fileManager.renameFile(file, nextPath);
+	} catch (error) {
+		if (isConvoAbortError(error)) {
+			return;
+		}
+
+		const message = error instanceof Error ? error.message : String(error);
+		logConvoDebug("chat.autoRetitle.failed", {
+			notePath: file.path,
+			error: message,
+		});
+		new Notice(`Convo GPT could not auto-retitle the chat: ${message}`);
+	}
+}
+
+function buildSiblingMarkdownPath(currentPath: string, nextBasename: string): string {
+	const slashIndex = currentPath.lastIndexOf("/");
+	const folder = slashIndex >= 0 ? currentPath.slice(0, slashIndex + 1) : "";
+	return `${folder}${nextBasename}.md`;
+}
+
+function tryParseJson(value: string): unknown {
+	try {
+		return JSON.parse(value) as unknown;
+	} catch {
+		return value;
+	}
+}
